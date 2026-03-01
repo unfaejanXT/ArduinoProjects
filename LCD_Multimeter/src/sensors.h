@@ -3,24 +3,118 @@
 #include <Arduino.h>
 #include "../config.h"
 
-// ─────────────────────────────────────────────────────────────────
-//  STATE INTERNAL SENSOR
-// ─────────────────────────────────────────────────────────────────
-static float _sensors_v_samples[SMOOTH_SAMPLES];
-static float _sensors_i_samples[SMOOTH_SAMPLES];
-static int   _sensors_sampleIdx   = 0;
-static float _sensors_smoothV     = 0.0;
-static float _sensors_smoothI     = 0.0;
-static float _sensors_rawV        = 0.0;
-static float _sensors_rawI        = 0.0;
-static float _sensors_power       = 0.0;
-static float _sensors_energy      = 0.0; // kWh atau Wh (opsional)
+// ==========================================
+// KALIBRASI (SESUAIKAN DENGAN ALAT UKUR ASLI)
+// ==========================================
 
-static float _sensors_rms_v_raw   = 0.0;
-static float _sensors_rms_i_raw   = 0.0;
+// Kalibrasi Tegangan (ZMPT101B)
+float voltage_calibration = 733.33;
 
-static unsigned long _sensors_lastRead = 0;
-static unsigned long _sensors_lastTime = 0;
+// Sensitivitas ACS712 20A adalah 100mV/A atau 0.100V/A (Untuk referensi 5V)
+float current_sensitivity = 0.100;
+// Kalibrasi Arus jika diperlukan (faktor pengali tambahan / penyesuaian)
+float current_calibration = 1.0; 
+// Offset / kelebihan pembacaan arus saat tanpa beban
+float current_offset = 0.06;
+
+// Variabel Penampung Nilai Sensonr (State)
+static float _sensors_v = 0.0;
+static float _sensors_i = 0.0;
+static float _sensors_p = 0.0;
+
+static unsigned long _sensors_last_read = 0;
+
+// ─────────────────────────────────────────────────────────────────
+//  FUNGSI ALGORITMA MURNI DARI USER
+// ─────────────────────────────────────────────────────────────────
+
+float measureVoltage() {
+  int max_val = 0;
+  int min_val = 1023;
+  
+  unsigned long start_time = millis();
+  // Sampling gelombang AC selama 100ms (5 siklus penuh untuk frekuensi PLN 50Hz)
+  // Mencari nilai puncak (peak) tertinggi dan terendah
+  while ((millis() - start_time) < 100) {
+    int val = analogRead(PIN_VOLT); // Menggunakan PIN dari config.h sesuai project Multimeter
+    if (val > max_val) max_val = val;
+    if (val < min_val) min_val = val;
+  }
+
+  // Menentukan selisih Peak-to-Peak (Vpp) dalam satuan nilai analog ADC
+  float val_pp = max_val - min_val;
+  
+  // Konversi ADC Vpp ke nilai tegangan Vpp sesungguhnya (referensi Arduino 5V)
+  float volt_pp = (val_pp * 5.0) / 1024.0;
+
+  // Konversi tegangan Peak-to-Peak ke Root Mean Square (Vrms)
+  // Rumus untuk gelombang sinus murni: Vrms = Vpp / (2 * akar(2)) atau Vpp * 0.35355
+  float volt_rms = volt_pp * 0.35355;
+
+  // Mengalikan Vrms dengan faktor pengaturan gain trimpot ZMPT101B untuk hitung voltase nyata
+  float final_voltage = volt_rms * voltage_calibration;
+
+  // Memfilter noise (batas filter ditingkatkan ke 30V untuk memblokir noise 13.9V)
+  // Saat kabel PLN dicabut, tegangan "mengambang" (floating) akan diabaikan
+  if (final_voltage < 30.0) {
+    final_voltage = 0.0;
+  }
+
+  return final_voltage;
+}
+
+float measureCurrent() {
+  unsigned long start_time;
+  unsigned long count = 0;
+  unsigned long sum = 0;
+
+  // --- Tahap 1: Mencari nilai titik tengah gelombang murni (DC Offset) ---
+  // Modul ACS712 secara teori mengapung di nilai analog 512 (2.5V). Namun dalam praktiknya 
+  // tegangan USB kadang 4.9V / 5.1V yang membuat titik tengahnya bergeser.
+  start_time = millis();
+  while ((millis() - start_time) < 40) { // 40ms = 2 siklus penuh gelombang AC 50Hz (cukup untuk cari rata-rata)
+    sum += analogRead(PIN_CURRENT); // Menggunakan PIN dari config.h
+    count++;
+  }
+  if (count == 0) return 0.0;
+  float dc_offset = (float)sum / count;
+
+  // --- Tahap 2: Menghitung True RMS (Akar Nilai Kuadrat Rata-Rata) ---
+  // Algoritma ini jauh lebih stabil dan tahan noise untuk beban kecil dari pada metode Peak-to-Peak.
+  float sum_sq = 0;
+  count = 0;
+  start_time = millis();
+  while ((millis() - start_time) < 100) { // 100ms = 5 siklus AC 50Hz
+    float val = (float)analogRead(PIN_CURRENT);
+    float centered = val - dc_offset;        // Menghilangkan offset DC
+    sum_sq += (centered * centered);         // Mengkuadratkan nilai
+    count++;
+  }
+  
+  if (count == 0) return 0.0;
+
+  // Root Mean Square dari sinyal ADC
+  float adc_rms = sqrt(sum_sq / count);
+
+  // Konversi rentang RMS ADC menuju tegangan Voltage RMS sesungguhnya
+  float volt_rms = (adc_rms * 5.0) / 1024.0;
+  
+  // Konversi Voltage RMS ke Ampere menggunakan sensitivitas chip (100mV/A = 0.100V/A)
+  float final_current = (volt_rms / current_sensitivity) * current_calibration;
+
+  // Pemotongan offset manual
+  final_current -= current_offset;
+
+  // Filter Noise: Dengan True RMS, perhitungan stabil dan noise sangat minim.
+  // Tapi karena versi chip ACS712 Anda punya batas 20A, pembacaan rentang miliAmpere jadi kurang peka.
+  // Kita hilangkan noise di bawah 0.05 A (sekitar Beban di bawah 11 Watt akan dianggap 0)
+  if (final_current < 0.05) {
+    final_current = 0.0;
+  }
+
+  return final_current;
+}
+
 
 // ─────────────────────────────────────────────────────────────────
 //  sensorsSetup()
@@ -28,131 +122,33 @@ static unsigned long _sensors_lastTime = 0;
 void sensorsSetup() {
     pinMode(PIN_VOLT, INPUT);
     pinMode(PIN_CURRENT, INPUT);
-    
-    // Inisialisasi array untuk moving average (Verifikasi sensor)
-    for (int i = 0; i < SMOOTH_SAMPLES; i++) {
-        _sensors_v_samples[i] = 0.0;
-        _sensors_i_samples[i] = 0.0;
-    }
-    _sensors_smoothV = 0.0;
-    _sensors_smoothI = 0.0;
-    _sensors_lastRead = millis();
-    _sensors_lastTime = millis();
 }
 
 // ─────────────────────────────────────────────────────────────────
-//  Hitung RMS
+//  sensorsForceRead() - Panggil fungsi User murni
 // ─────────────────────────────────────────────────────────────────
-static void _sensorsReadRawRMS() {
-    long sum_v_sq = 0;
-    long sum_i_sq = 0;
-    int samples = SAMPLES_PER_CYCLE;
-    
-    // Ambil sampel selama kurang lebih 1-2 siklus AC (20-40 ms)
-    for (int i = 0; i < samples; i++) {
-        long v_raw = analogRead(PIN_VOLT) - VOLT_OFFSET_RAW;
-        long i_raw = analogRead(PIN_CURRENT) - CURRENT_OFFSET_RAW;
-        
-        sum_v_sq += v_raw * v_raw;
-        sum_i_sq += i_raw * i_raw;
-    }
-    
-    // Rata-rata kuadrat
-    float avg_v_sq = (float)sum_v_sq / samples;
-    float avg_i_sq = (float)sum_i_sq / samples;
-    
-    // Akar kuadrat untuk mendapatkan Nilai RMS ADC (belum dalam Volt/Ampere nyata)
-    float rms_v_raw = sqrt(avg_v_sq);
-    float rms_i_raw = sqrt(avg_i_sq);
-    
-    _sensors_rms_v_raw = rms_v_raw;
-    _sensors_rms_i_raw = rms_i_raw;
-    
-    // Konversi ke Unit Nyata (Voltase)
-    // Berbeda dari ACS, ZMPT tidak perlu dibagi 512, RMS raw-nya langsung dikali kalibrasi 
-    // karena kalibrasi biasanya berdasarkan perbandingan Avometer / RMS ADC_Value (contoh: kalibrasi sekitar ~1.8 ke ~2.2)
-    _sensors_rawV = rms_v_raw * VOLT_CALIBRATION; 
-    
-    // Konversi ke Unit Nyata (Arus)
-    // Konversi ADC ke Voltage: (RMS raw / 1024.0) * 5.0
-    float i_voltage = (rms_i_raw / 1024.0) * 5.0;
-    _sensors_rawI   = i_voltage / CURRENT_CALIBRATION;
-    
-    // --------------------------------------------------------------------------
-    // FILTER NOISE ADC (Mencegah Volt bocor saat mati / arus bocor 0.27A)
-    // --------------------------------------------------------------------------
-    // ZMPT1010B sering loncat 10 - 30V akibat float/noise kecil di pin analog.
-    if (_sensors_rawV < 40.0) {
-        _sensors_rawV = 0.0;
-    }
-    
-    // Berdasarkan analisis LOG baru, batas RMS < 15.0 terlalu tinggi sehingga
-    // kipas angin kecil ikut tertendang jadi 0. Kita rendahkan Clamp-nya kembali ke 0.19A
-    // Jika arus yang dikalkulasikan (sebelum di-average) sangat kecil (di bawah 190 mA), jadikan 0
-    if (_sensors_rawI < 0.19) {
-        _sensors_rawI = 0.0;
-    }
-    
-    // Jika tegangan alat sedang OFF (0V) / Relay mati, paksa Arus terindikasi sebagai 0
-    if (_sensors_rawV == 0.0) {
-        _sensors_rawI = 0.0;
-    }
+void sensorsForceRead() {
+    _sensors_v = measureVoltage();
+    _sensors_i = measureCurrent();
+    _sensors_p = _sensors_v * _sensors_i;
 }
 
 // ─────────────────────────────────────────────────────────────────
-//  _sensorsMovingAverage
-// ─────────────────────────────────────────────────────────────────
-static void _sensorsMovingAverage() {
-    _sensors_v_samples[_sensors_sampleIdx] = _sensors_rawV;
-    _sensors_i_samples[_sensors_sampleIdx] = _sensors_rawI;
-    
-    _sensors_sampleIdx = (_sensors_sampleIdx + 1) % SMOOTH_SAMPLES;
-
-    float sumV = 0.0;
-    float sumI = 0.0;
-    for (int i = 0; i < SMOOTH_SAMPLES; i++) {
-        sumV += _sensors_v_samples[i];
-        sumI += _sensors_i_samples[i];
-    }
-    
-    _sensors_smoothV = sumV / SMOOTH_SAMPLES;
-    _sensors_smoothI = sumI / SMOOTH_SAMPLES;
-    
-    // Hitung power
-    _sensors_power = _sensors_smoothV * _sensors_smoothI;
-}
-
-// ─────────────────────────────────────────────────────────────────
-//  sensorsLoop()
+//  sensorsLoop() - Dipanggil secara berkala
 // ─────────────────────────────────────────────────────────────────
 void sensorsLoop() {
-    unsigned long now = millis();
-    if (now - _sensors_lastRead >= SENSOR_READ_MS) {
-        _sensors_lastRead = now;
-        
-        _sensorsReadRawRMS();
-        _sensorsMovingAverage();
-        
-        // Integrasi Daya menjadi Energi (Wh)
-        float dt_hours = (now - _sensors_lastTime) / 3600000.0; // Konversi ms ke jam
-        _sensors_energy += _sensors_power * dt_hours;
-        _sensors_lastTime = now;
+    // Baca sensor setiap 500ms
+    if (millis() - _sensors_last_read >= 500) {
+        sensorsForceRead();
+        _sensors_last_read = millis();
     }
 }
 
 // ─────────────────────────────────────────────────────────────────
-//  GETTER FUNCTIONS
+//  Getters
 // ─────────────────────────────────────────────────────────────────
-// Memaksa bacaan tanpa menunggu timer (Berguna untuk testing Looping)
-void sensorsForceRead() {
-    _sensorsReadRawRMS();
-    _sensorsMovingAverage();
-    _sensors_lastRead = millis();
-}
-
-float sensorsGetVoltage() { return _sensors_smoothV; }
-float sensorsGetCurrent() { return _sensors_smoothI; }
-float sensorsGetPower()   { return _sensors_power;   }
-float sensorsGetEnergy()  { return _sensors_energy;  }
-float sensorsGetRawRMSVoltage() { return _sensors_rms_v_raw; }
-float sensorsGetRawRMSCurrent() { return _sensors_rms_i_raw; }
+float sensorsGetRawRMSVoltage() { return 0.0; }
+float sensorsGetRawRMSCurrent() { return 0.0; }
+float sensorsGetVoltage()       { return _sensors_v; }
+float sensorsGetCurrent()       { return _sensors_i; }
+float sensorsGetPower()         { return _sensors_p; }
